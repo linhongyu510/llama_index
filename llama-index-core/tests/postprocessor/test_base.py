@@ -63,7 +63,7 @@ def test_forward_back_processor(tmp_path: Path) -> None:
     assert len(processed_nodes) == 3
     assert processed_nodes[0].node.node_id == "3"
     assert processed_nodes[1].node.node_id == "2"
-    assert processed_nodes[2].node.node.node_id == "1"
+    assert processed_nodes[2].node.node_id == "1"
 
     # check for multiple nodes (nodes should not be duped)
     node_postprocessor = PrevNextNodePostprocessor(
@@ -362,9 +362,7 @@ def test_time_weighted_postprocessor() -> None:
         TextNode(text="This is another test.", id_="3", metadata={key: 2}),
         TextNode(text="This is a test v2.", id_="4", metadata={key: 3}),
     ]
-    node_with_scores = [
-        NodeWithScore(node=node, score=-float(idx)) for idx, node in enumerate(nodes)
-    ]
+    node_with_scores = [NodeWithScore(node=node, score=-float(idx)) for idx, node in enumerate(nodes)]
     postprocessor = TimeWeightedPostprocessor(
         top_k=1, time_decay=0.000000000002, time_access_refresh=True, now=4.0
     )
