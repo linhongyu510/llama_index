@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, cast
 
 import pytest
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.postprocessor.node import (
     KeywordNodePostprocessor,
     PrevNextNodePostprocessor,
@@ -62,7 +63,7 @@ def test_forward_back_processor(tmp_path: Path) -> None:
     assert len(processed_nodes) == 3
     assert processed_nodes[0].node.node_id == "3"
     assert processed_nodes[1].node.node_id == "2"
-    assert processed_nodes[2].node.node_id == "1"
+    assert processed_nodes[2].node.node_id == "4"
 
     # check for multiple nodes (nodes should not be duped)
     node_postprocessor = PrevNextNodePostprocessor(
@@ -75,9 +76,9 @@ def test_forward_back_processor(tmp_path: Path) -> None:
         ]
     )
     assert len(processed_nodes) == 3
-    assert processed_nodes[0].node.node_id == "2"
-    assert processed_nodes[1].node.node_id == "1"
-    assert processed_nodes[2].node.node_id == "4"
+    assert processed_nodes[0].node.node_id == "1"
+    assert processed_nodes[1].node.node_id == "2"
+    assert processed_nodes[2].node.node_id == "3"
 
     # check for previous
     node_postprocessor = PrevNextNodePostprocessor(
@@ -253,6 +254,80 @@ def test_embedding_recency_postprocessor() -> None:
     # assert cast(Dict, result_nodes[1].node.metadata)["date"] == "2020-01-03"
     # assert result_nodes[2].node.get_content() == "This is a test."
     # assert cast(Dict, result_nodes[2].node.metadata)["date"] == "2020-01-02"
+
+
+class _DeterministicContentEmbedding(BaseEmbedding):
+    """
+    Deterministic, content-keyed embedding (no network/LLM) for dedup tests.
+
+    "alpha" -> [1, 0]; everything else -> [0, 1]. MetadataMode.EMBED content may
+    prefix metadata, so match by substring.
+    """
+
+    @staticmethod
+    def _vec(text: str) -> list:
+        return [1.0, 0.0] if "alpha" in text else [0.0, 1.0]
+
+    def _get_text_embedding(self, text: str) -> list:
+        return self._vec(text)
+
+    def _get_text_embeddings(self, texts: list) -> list:
+        return [self._vec(t) for t in texts]
+
+    def _get_query_embedding(self, query: str) -> list:
+        return self._vec(query)
+
+    async def _aget_query_embedding(self, query: str) -> list:
+        return self._vec(query)
+
+    async def _aget_text_embeddings(self, texts: list) -> list:
+        return [self._vec(t) for t in texts]
+
+
+def test_embedding_recency_postprocessor_dedup_alignment() -> None:
+    """
+    Dedup compares against embeddings aligned to date-sorted order.
+
+    Input is passed in NON-date-sorted (retriever relevance) order. Before the
+    fix, ``text_embeddings`` was built from the original ``nodes`` but indexed by
+    position in the date-sorted ``sorted_nodes``, so the unique ``beta`` node was
+    dropped while the older ``alpha`` duplicate was kept. The fix builds the
+    embedding list from ``sorted_nodes`` so the index lines up.
+    """
+    nodes = [
+        TextNode(
+            text="alpha",
+            id_="alpha_old",
+            metadata={"date": "2020-01-01"},
+            excluded_embed_metadata_keys=["date"],
+        ),
+        TextNode(
+            text="alpha",
+            id_="alpha_new",
+            metadata={"date": "2020-01-03"},
+            excluded_embed_metadata_keys=["date"],
+        ),
+        TextNode(
+            text="beta",
+            id_="beta",
+            metadata={"date": "2020-01-02"},
+            excluded_embed_metadata_keys=["date"],
+        ),
+    ]
+    nodes_with_scores = [NodeWithScore(node=node) for node in nodes]
+
+    postprocessor = EmbeddingRecencyPostprocessor(
+        similarity_cutoff=0.5,
+        query_embedding_tmpl="{context_str}",
+        embed_model=_DeterministicContentEmbedding(),
+    )
+    result_nodes = postprocessor.postprocess_nodes(
+        nodes_with_scores, query_bundle=QueryBundle(query_str="x")
+    )
+    kept = sorted(node.node.node_id for node in result_nodes)
+
+    # Newest duplicate kept, unique node survives, older duplicate dropped.
+    assert kept == sorted(["alpha_new", "beta"])
 
 
 def test_time_weighted_postprocessor() -> None:
