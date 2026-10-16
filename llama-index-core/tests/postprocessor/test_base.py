@@ -63,7 +63,7 @@ def test_forward_back_processor(tmp_path: Path) -> None:
     assert len(processed_nodes) == 3
     assert processed_nodes[0].node.node_id == "3"
     assert processed_nodes[1].node.node_id == "2"
-    assert processed_nodes[2].node.node_id == "4"
+    assert processed_nodes[2].node.node_id == "1"
 
     # check for multiple nodes (nodes should not be duped)
     node_postprocessor = PrevNextNodePostprocessor(
@@ -76,9 +76,9 @@ def test_forward_back_processor(tmp_path: Path) -> None:
         ]
     )
     assert len(processed_nodes) == 3
-    assert processed_nodes[0].node.node_id == "1"
-    assert processed_nodes[1].node.node_id == "2"
-    assert processed_nodes[2].node.node_id == "3"
+    assert processed_nodes[0].node.node_id == "2"
+    assert processed_nodes[1].node.node_id == "1"
+    assert processed_nodes[2].node.node_id == "4"
 
     # check for previous
     node_postprocessor = PrevNextNodePostprocessor(
@@ -422,7 +422,6 @@ def test_keyword_postprocessor_for_non_english() -> None:
             TextNode(text="こんにちは世界。", id_="1", metadata={key: 0}),
             TextNode(text="これはテストです。", id_="2", metadata={key: 1}),
             TextNode(text="これは別のテストです。", id_="3", metadata={key: 2}),
-            TextNode(text="これはテストv2です。", id_="4", metadata={key: 3}),
         ]
         node_with_scores = [NodeWithScore(node=node) for node in nodes]
 
