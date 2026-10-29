@@ -362,7 +362,9 @@ def test_time_weighted_postprocessor() -> None:
         TextNode(text="This is another test.", id_="3", metadata={key: 2}),
         TextNode(text="This is a test v2.", id_="4", metadata={key: 3}),
     ]
-    node_with_scores = [NodeWithScore(node=node, score=-float(idx)) for idx, node in enumerate(nodes)]
+    node_with_scores = [
+        NodeWithScore(node=node, score=-float(idx)) for idx, node in enumerate(nodes)
+    ]
     postprocessor = TimeWeightedPostprocessor(
         top_k=1, time_decay=0.000000000002, time_access_refresh=True, now=4.0
     )
