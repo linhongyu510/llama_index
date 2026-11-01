@@ -170,6 +170,12 @@ class KVDocumentStore(BaseDocumentStore):
         metadata_kv_pairs = []
         ref_doc_kv_pairs: Dict[str, List[Tuple[str, dict]]] = {}
 
+        # Track final ref_doc_id per node_id in this batch (last-write-wins)
+        # Include all occurrences, even those without SOURCE (final ref is None).
+        batch_final_refs: Dict[str, Optional[str]] = {}
+        for node in nodes:
+            batch_final_refs[node.node_id] = node.ref_doc_id
+
         for node in nodes:
             # NOTE: doc could already exist in the store, but we overwrite it
             if not allow_update and self.document_exists(node.node_id):
@@ -183,11 +189,27 @@ class KVDocumentStore(BaseDocumentStore):
                     self.get_ref_doc_info(node.source_node.node_id) or RefDocInfo()
                 )
 
+            # If this node appears again later in the batch with a different ref_doc_id,
+            # we should not add it to the current ref_doc_info's node_ids yet.
+            # Only the final occurrence in the batch should update the ref_doc_info.
+            # If node has no SOURCE, ref_doc_id is None, and we skip adding to ref_doc_info.
+            final_ref = batch_final_refs.get(node.node_id)
+            is_final_occurrence = final_ref == node.ref_doc_id
+            if not is_final_occurrence and allow_update:
+                # Intermediate occurrence: skip adding to ref_doc_info.node_ids
+                # to avoid stale mappings when last-write-wins.
+                ref_doc_info_for_insert = None
+            elif node.source_node is None:
+                # No SOURCE: don't add to any ref_doc_info
+                ref_doc_info_for_insert = None
+            else:
+                ref_doc_info_for_insert = ref_doc_info
+
             (
                 node_kv_pair,
                 metadata_kv_pair,
                 ref_doc_kv_pair,
-            ) = self._get_kv_pairs_for_insert(node, ref_doc_info, store_text)
+            ) = self._get_kv_pairs_for_insert(node, ref_doc_info_for_insert, store_text)
 
             if node_kv_pair is not None:
                 node_kv_pairs.append(node_kv_pair)
@@ -202,7 +224,96 @@ class KVDocumentStore(BaseDocumentStore):
         # multiple nodes can point to the same ref_doc_id
         merged_ref_doc_kv_pairs = self._merge_ref_doc_kv_pairs(ref_doc_kv_pairs)
 
+        # When allow_update=True and a node's ref_doc_id (SOURCE relationship) changes,
+        # remove the node_id from the old ref_doc_info so that delete_ref_doc on the
+        # old ref does not incorrectly delete a node that now belongs to a new ref.
+        if allow_update:
+            merged_ref_doc_kv_pairs = self._cleanup_stale_ref_doc_ids(
+                nodes, merged_ref_doc_kv_pairs
+            )
+
         return node_kv_pairs, metadata_kv_pairs, merged_ref_doc_kv_pairs
+
+    def _cleanup_stale_ref_doc_ids(
+        self,
+        nodes: Sequence[BaseNode],
+        merged_ref_doc_kv_pairs: List[Tuple[str, dict]],
+    ) -> List[Tuple[str, dict]]:
+        """
+        Remove stale node_ids from old/intermediate ref_doc_info when a node's
+        ref_doc_id changes in a batch.
+
+        For each node_id, we look at the FINAL ref_doc_id (last occurrence in batch).
+        We remove the node_id from:
+        - The old stored ref_doc_id (from metadata)
+        - Any intermediate ref_doc_id that appeared in the batch but isn't the final one
+
+        The node_id remains in the final ref_doc_info's node_ids.
+        """
+        ref_doc_dict: Dict[str, dict] = dict(merged_ref_doc_kv_pairs)
+
+        # Build final ref per node_id (last occurrence wins)
+        final_refs: Dict[str, Optional[str]] = {}
+        all_refs_per_node: Dict[str, List[Optional[str]]] = {}
+        for node in nodes:
+            final_refs[node.node_id] = node.ref_doc_id
+            if node.node_id not in all_refs_per_node:
+                all_refs_per_node[node.node_id] = []
+            all_refs_per_node[node.node_id].append(node.ref_doc_id)
+
+        processed_nodes: set = set()
+
+        for node in nodes:
+            if node.node_id in processed_nodes:
+                continue
+            processed_nodes.add(node.node_id)
+
+            final_ref = final_refs[node.node_id]
+
+            # Get old stored ref from metadata
+            old_metadata = self._kvstore.get(
+                node.node_id, collection=self._metadata_collection
+            )
+            old_ref_doc_id = old_metadata.get("ref_doc_id") if old_metadata else None
+
+            # Collect all refs to clean up: old stored ref + intermediate batch refs
+            refs_to_cleanup: set = set()
+            if old_ref_doc_id is not None and old_ref_doc_id != final_ref:
+                refs_to_cleanup.add(old_ref_doc_id)
+            for ref in all_refs_per_node[node.node_id]:
+                if ref is not None and ref != final_ref:
+                    refs_to_cleanup.add(ref)
+
+            # Remove node_id from each stale ref_doc_info
+            for stale_ref in refs_to_cleanup:
+                if stale_ref in ref_doc_dict:
+                    stale_node_ids = ref_doc_dict[stale_ref].get("node_ids", [])
+                    if node.node_id in stale_node_ids:
+                        # Create new filtered list instead of mutating in place,
+                        # so a failed write leaves stored metadata unchanged
+                        filtered_ids = [
+                            nid for nid in stale_node_ids if nid != node.node_id
+                        ]
+                        ref_doc_dict[stale_ref]["node_ids"] = filtered_ids
+                else:
+                    # Stale ref not in current batch - load from store and clean up
+                    stale_ref_info = self.get_ref_doc_info(stale_ref)
+                    if (
+                        stale_ref_info is not None
+                        and node.node_id in stale_ref_info.node_ids
+                    ):
+                        # Create new filtered list instead of mutating in place,
+                        # so a failed write leaves stored metadata unchanged
+                        filtered_ids = [
+                            nid
+                            for nid in stale_ref_info.node_ids
+                            if nid != node.node_id
+                        ]
+                        ref_dict = stale_ref_info.to_dict()
+                        ref_dict["node_ids"] = filtered_ids
+                        ref_doc_dict[stale_ref] = ref_dict
+
+        return list(ref_doc_dict.items())
 
     def add_documents(
         self,
@@ -273,6 +384,12 @@ class KVDocumentStore(BaseDocumentStore):
         metadata_kv_pairs = []
         ref_doc_kv_pairs: Dict[str, List[Tuple[str, dict]]] = {}
 
+        # Track final ref_doc_id per node_id in this batch (last-write-wins)
+        # Include all occurrences, even those without SOURCE (final ref is None).
+        batch_final_refs: Dict[str, Optional[str]] = {}
+        for node in nodes:
+            batch_final_refs[node.node_id] = node.ref_doc_id
+
         for node in nodes:
             # NOTE: doc could already exist in the store, but we overwrite it
             if not allow_update and await self.adocument_exists(node.node_id):
@@ -287,11 +404,23 @@ class KVDocumentStore(BaseDocumentStore):
                     or RefDocInfo()
                 )
 
+            # If this node appears again later in the batch with a different ref_doc_id,
+            # skip adding to ref_doc_info.node_ids for intermediate occurrences.
+            final_ref = batch_final_refs.get(node.node_id)
+            is_final_occurrence = final_ref == node.ref_doc_id
+            if not is_final_occurrence and allow_update:
+                ref_doc_info_for_insert = None
+            elif node.source_node is None:
+                # No SOURCE: don't add to any ref_doc_info
+                ref_doc_info_for_insert = None
+            else:
+                ref_doc_info_for_insert = ref_doc_info
+
             (
                 node_kv_pair,
                 metadata_kv_pair,
                 ref_doc_kv_pair,
-            ) = self._get_kv_pairs_for_insert(node, ref_doc_info, store_text)
+            ) = self._get_kv_pairs_for_insert(node, ref_doc_info_for_insert, store_text)
 
             if node_kv_pair is not None:
                 node_kv_pairs.append(node_kv_pair)
@@ -306,7 +435,85 @@ class KVDocumentStore(BaseDocumentStore):
         # multiple nodes can point to the same ref_doc_id
         merged_ref_doc_kv_pairs = self._merge_ref_doc_kv_pairs(ref_doc_kv_pairs)
 
+        # When allow_update=True and a node's ref_doc_id (SOURCE relationship) changes,
+        # remove the node_id from the old ref_doc_info so that delete_ref_doc on the
+        # old ref does not incorrectly delete a node that now belongs to a new ref.
+        if allow_update:
+            merged_ref_doc_kv_pairs = await self._acleanup_stale_ref_doc_ids(
+                nodes, merged_ref_doc_kv_pairs
+            )
+
         return node_kv_pairs, metadata_kv_pairs, merged_ref_doc_kv_pairs
+
+    async def _acleanup_stale_ref_doc_ids(
+        self,
+        nodes: Sequence[BaseNode],
+        merged_ref_doc_kv_pairs: List[Tuple[str, dict]],
+    ) -> List[Tuple[str, dict]]:
+        """Async version of _cleanup_stale_ref_doc_ids."""
+        ref_doc_dict: Dict[str, dict] = dict(merged_ref_doc_kv_pairs)
+
+        # Build final ref per node_id (last occurrence wins)
+        final_refs: Dict[str, Optional[str]] = {}
+        all_refs_per_node: Dict[str, List[Optional[str]]] = {}
+        for node in nodes:
+            final_refs[node.node_id] = node.ref_doc_id
+            if node.node_id not in all_refs_per_node:
+                all_refs_per_node[node.node_id] = []
+            all_refs_per_node[node.node_id].append(node.ref_doc_id)
+
+        processed_nodes: set = set()
+
+        for node in nodes:
+            if node.node_id in processed_nodes:
+                continue
+            processed_nodes.add(node.node_id)
+
+            final_ref = final_refs[node.node_id]
+
+            # Get old stored ref from metadata
+            old_metadata = await self._kvstore.aget(
+                node.node_id, collection=self._metadata_collection
+            )
+            old_ref_doc_id = old_metadata.get("ref_doc_id") if old_metadata else None
+
+            # Collect all refs to clean up: old stored ref + intermediate batch refs
+            refs_to_cleanup: set = set()
+            if old_ref_doc_id is not None and old_ref_doc_id != final_ref:
+                refs_to_cleanup.add(old_ref_doc_id)
+            for ref in all_refs_per_node[node.node_id]:
+                if ref is not None and ref != final_ref:
+                    refs_to_cleanup.add(ref)
+
+            # Remove node_id from each stale ref_doc_info
+            for stale_ref in refs_to_cleanup:
+                if stale_ref in ref_doc_dict:
+                    stale_node_ids = ref_doc_dict[stale_ref].get("node_ids", [])
+                    if node.node_id in stale_node_ids:
+                        # Create new filtered list instead of mutating in place,
+                        # so a failed write leaves stored metadata unchanged
+                        filtered_ids = [
+                            nid for nid in stale_node_ids if nid != node.node_id
+                        ]
+                        ref_doc_dict[stale_ref]["node_ids"] = filtered_ids
+                else:
+                    stale_ref_info = await self.aget_ref_doc_info(stale_ref)
+                    if (
+                        stale_ref_info is not None
+                        and node.node_id in stale_ref_info.node_ids
+                    ):
+                        # Create new filtered list instead of mutating in place,
+                        # so a failed write leaves stored metadata unchanged
+                        filtered_ids = [
+                            nid
+                            for nid in stale_ref_info.node_ids
+                            if nid != node.node_id
+                        ]
+                        ref_dict = stale_ref_info.to_dict()
+                        ref_dict["node_ids"] = filtered_ids
+                        ref_doc_dict[stale_ref] = ref_dict
+
+        return list(ref_doc_dict.items())
 
     async def async_add_documents(
         self,
